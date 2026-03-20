@@ -53,7 +53,7 @@ A production-quality FastAPI-based proxy server for Google Gemini API with Anthr
 ### Quick Installation (with systemd)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/art9762/Gemini-Suite.git
 cd gemini-suite/gemini-proxy
 sudo chmod +x install.sh
 sudo ./install.sh

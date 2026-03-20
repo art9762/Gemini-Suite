@@ -25,7 +25,7 @@ A production-quality CLI tool powered by Google Gemini API, similar to Claude Co
 ### Automatic Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/art9762/Gemini-Suite.git
 cd gemini-suite/gemini-cli
 chmod +x install.sh
 ./install.sh
