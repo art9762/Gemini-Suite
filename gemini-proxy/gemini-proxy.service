@@ -1,0 +1,32 @@
+[Unit]
+Description=Gemini Proxy Server
+Documentation=https://github.com/your-org/gemini-suite
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gemini-proxy
+Group=gemini-proxy
+WorkingDirectory=/opt/gemini-proxy
+EnvironmentFile=/etc/gemini-proxy/config.env
+ExecStart=/opt/gemini-proxy/venv/bin/python3 /opt/gemini-proxy/gemini_proxy.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gemini-proxy
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/gemini-proxy
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target
