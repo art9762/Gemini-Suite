@@ -5,7 +5,7 @@ A production-quality CLI tool powered by Google Gemini API, similar to Claude Co
 ## Features
 
 - **Interactive REPL Chat Interface**: Multi-turn conversations with full context maintained across messages
-- **Streaming Responses**: Real-time token streaming from Gemini API with spinners
+- **Streaming Responses**: Receive Gemini responses as a stream, then render the complete answer with syntax highlighting
 - **Syntax-Highlighted Code**: Beautiful code output using the Rich library with language detection
 - **File Editing**: Ask the AI to suggest file edits and apply them directly
 - **Shell Command Execution**: Execute shell commands with user confirmation prompts
@@ -65,8 +65,9 @@ Configuration is stored in `~/.gemini-cli/config.json`:
   "api_key": "YOUR_GEMINI_API_KEY",
   "model": "gemini-1.5-pro",
   "server_url": "ws://localhost:8000/ws/remote",
-  "remote_enabled": false,
-  "timeout": 30
+  "proxy_api_key": "YOUR_PROXY_API_KEY",
+  "auto_remote": false,
+  "timeout": 60
 }
 ```
 
@@ -132,6 +133,7 @@ You > /model gemini-1.5-flash
 
 | Command | Description |
 |---------|-------------|
+| `/remote setup` | Configure the proxy WebSocket URL and its `PROXY_API_KEY` |
 | `/remote on` | Connect to proxy server for remote control |
 | `/remote off` | Disconnect from remote server |
 
@@ -143,7 +145,7 @@ Simply type your message and press Enter:
 You > Explain quantum computing in simple terms
 ```
 
-The response will be streamed in real-time with syntax highlighting for code blocks.
+The response is received as a stream and rendered in full after completion, with syntax highlighting for code blocks.
 
 ### File Editing
 
@@ -174,6 +176,9 @@ Remote mode allows you to control the CLI from a gemini-proxy server via WebSock
 2. In your Gemini CLI session:
 
 ```
+You > /remote setup
+WebSocket URL: ws://localhost:8000/ws/remote
+PROXY_API_KEY: [hidden input]
 You > /remote on
 Connecting to ws://localhost:8000/ws/remote...
 ✓ Remote mode enabled
@@ -183,7 +188,9 @@ Connecting to ws://localhost:8000/ws/remote...
 
 ### How It Works
 
-- CLI connects to proxy server via WebSocket
+- CLI connects to the proxy via WebSocket with an `X-API-Key` upgrade header
+- The server accepts the socket, validates registration, and replies with `{"type":"registered","client_id":"..."}`
+- Async terminal input keeps the listener active while the REPL waits; local and remote Gemini turns are serialized
 - Registers itself with a unique client ID
 - Waits for prompt messages from the proxy
 - Sends responses back to the proxy
@@ -228,6 +235,7 @@ Main application:
 - **websockets** - WebSocket client for remote management
 - **rich** - Beautiful terminal UI with syntax highlighting
 - **aiofiles** - Async file I/O operations
+- **prompt-toolkit** - Cancellable async terminal input and background output
 
 ## Performance
 
@@ -279,7 +287,7 @@ pip install --upgrade -r requirements.txt
 
 ## Security
 
-- API keys are stored locally in `~/.gemini-cli/config.json`
+- Gemini and proxy API keys are stored locally in `~/.gemini-cli/config.json`; saves enforce directory mode 700 and file mode 600, and `/config` masks both keys
 - Configure file permissions: `chmod 600 ~/.gemini-cli/config.json`
 - Never commit config file with API key to version control
 - API calls go directly to Google's servers
@@ -321,10 +329,10 @@ Terminal 1: gemini-cli
 You > /remote on
 ✓ Remote mode enabled
 
-Terminal 2: curl -X POST http://localhost:8000/v1/messages \
+Terminal 2: curl -X POST http://localhost:8000/v1/remote/send \
   -H "X-API-Key: secret-key" \
   -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Say hello"}]}'
+  -d '{"client_id": "COPY_ID_FROM_REMOTE_ON", "prompt": "Say hello"}'
 
 Terminal 1: Remote prompt: Say hello
 ✓ Response sent to server
@@ -351,3 +359,8 @@ For issues, feature requests, or contributions, visit the project repository.
 ## Author
 
 Developed as a production-quality CLI alternative to Claude Code, powered by Google Gemini API.
+
+
+## Development checks
+
+From the repository root, install `requirements-dev.txt` in a virtual environment and run `python -m pytest -q`. All Gemini responses are mocked; the integration test runs only a local loopback proxy and verifies a remote answer while terminal input is pending. Old clients must be upgraded for the authenticated registration handshake. Actual model availability and paid API behavior are not covered. Remote prompts generate text; they do not automatically execute shell commands or apply file edits.

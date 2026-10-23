@@ -1,0 +1,5 @@
+-r gemini-cli/requirements.txt
+-r gemini-proxy/requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.23
+wsproto>=1.2.0

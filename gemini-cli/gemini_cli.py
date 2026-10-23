@@ -16,20 +16,21 @@ import platform
 import subprocess
 import sys
 import re
-from datetime import datetime
+import uuid
+from contextlib import aclosing, suppress
 from pathlib import Path
 from typing import Optional
 
 import aiofiles
 import httpx
 import websockets
+from websockets.asyncio.client import connect as websocket_connect
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
 from rich.syntax import Syntax
-from rich.spinner import Spinner
-from rich.live import Live
 from rich.text import Text
 from rich.table import Table
 
@@ -65,6 +66,7 @@ class Config:
             "api_key": "",
             "model": DEFAULT_MODEL,
             "server_url": DEFAULT_SERVER,
+            "proxy_api_key": "",
             "timeout": 60,
             "max_tokens": 8192,
             "temperature": 0.7,
@@ -74,7 +76,10 @@ class Config:
 
     def save(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.config_file, "w") as f:
+        self.config_dir.chmod(0o700)
+        fd = os.open(self.config_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), 0o600)
             json.dump(self.data, f, indent=2, ensure_ascii=False)
 
     def get(self, key: str, default=None):
@@ -96,17 +101,22 @@ class GeminiClient:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.conversation_history = []
+        self._conversation_lock = asyncio.Lock()
 
     async def chat(self, prompt: str) -> tuple[str, bool]:
         """Send a message and get the full response (non-streaming)."""
+        async with self._conversation_lock:
+            return await self._chat(prompt)
+
+    async def _chat(self, prompt: str) -> tuple[str, bool]:
         if not self.api_key:
             return "Ошибка: API ключ не настроен. Используйте /setup", False
 
-        self.conversation_history.append({"role": "user", "parts": [{"text": prompt}]})
+        user_message = {"role": "user", "parts": [{"text": prompt}]}
 
         url = f"{GEMINI_API_BASE}/{self.model}:generateContent"
         payload = {
-            "contents": self.conversation_history,
+            "contents": [*self.conversation_history, user_message],
             "generationConfig": {
                 "temperature": self.temperature,
                 "topP": 0.95,
@@ -134,9 +144,9 @@ class GeminiClient:
                 text = "".join(p.get("text", "") for p in parts)
 
                 if text:
-                    self.conversation_history.append(
-                        {"role": "model", "parts": [{"text": text}]}
-                    )
+                    self.conversation_history.extend([
+                        user_message, {"role": "model", "parts": [{"text": text}]}
+                    ])
                     return text, True
                 return "Пустой ответ", False
 
@@ -149,15 +159,21 @@ class GeminiClient:
 
     async def stream_chat(self, prompt: str):
         """Stream chat response, yields text chunks."""
+        async with self._conversation_lock:
+            async with aclosing(self._stream_chat(prompt)) as stream:
+                async for chunk in stream:
+                    yield chunk
+
+    async def _stream_chat(self, prompt: str):
         if not self.api_key:
             yield "Ошибка: API ключ не настроен. Используйте /setup"
             return
 
-        self.conversation_history.append({"role": "user", "parts": [{"text": prompt}]})
+        user_message = {"role": "user", "parts": [{"text": prompt}]}
 
         url = f"{GEMINI_API_BASE}/{self.model}:streamGenerateContent"
         payload = {
-            "contents": self.conversation_history,
+            "contents": [*self.conversation_history, user_message],
             "generationConfig": {
                 "temperature": self.temperature,
                 "topP": 0.95,
@@ -198,23 +214,28 @@ class GeminiClient:
                             continue
 
             if response_text:
-                self.conversation_history.append(
-                    {"role": "model", "parts": [{"text": response_text}]}
-                )
+                self.conversation_history.extend([
+                    user_message, {"role": "model", "parts": [{"text": response_text}]}
+                ])
+            else:
+                yield "Пустой ответ от API"
         except Exception as e:
             yield f"\nОшибка: {e}"
 
-    def clear_history(self) -> None:
-        self.conversation_history = []
+    async def clear_history(self) -> None:
+        async with self._conversation_lock:
+            self.conversation_history = []
 
 
 class RemoteManager:
     """Manages WebSocket connection to gemini-proxy for remote control."""
 
-    def __init__(self, server_url: str, client_id: str, console: Console):
+    def __init__(self, server_url: str, client_id: str, console: Console,
+                 proxy_api_key: str = ""):
         self.server_url = server_url
         self.client_id = client_id
         self.console = console
+        self.proxy_api_key = proxy_api_key
         self.ws = None
         self.connected = False
         self._listen_task: Optional[asyncio.Task] = None
@@ -222,8 +243,12 @@ class RemoteManager:
     async def connect(self) -> bool:
         """Connect to remote proxy server and register."""
         try:
-            self.ws = await websockets.connect(
+            if not self.proxy_api_key:
+                self.console.print("[red]Ключ прокси не настроен. Используйте /remote setup[/red]")
+                return False
+            self.ws = await websocket_connect(
                 self.server_url,
+                additional_headers={"X-API-Key": self.proxy_api_key},
                 ping_interval=20,
                 ping_timeout=10,
             )
@@ -231,18 +256,27 @@ class RemoteManager:
                 "type": "register",
                 "client_id": self.client_id,
             }))
+            registration = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=10))
+            if registration.get("type") != "registered" or registration.get("client_id") != self.client_id:
+                raise ValueError("Сервер не подтвердил регистрацию")
             self.connected = True
             return True
         except Exception as e:
+            if self.ws:
+                await self.ws.close()
+                self.ws = None
             self.console.print(f"[red]Не удалось подключиться: {e}[/red]")
             return False
 
     async def disconnect(self) -> None:
         if self._listen_task:
             self._listen_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._listen_task
             self._listen_task = None
         if self.ws:
             await self.ws.close()
+            self.ws = None
         self.connected = False
 
     async def listen_and_handle(self, gemini_client: GeminiClient) -> None:
@@ -277,8 +311,6 @@ class RemoteManager:
                         "response": response_text,
                     }))
 
-                    # Show a preview locally
-                    preview = response_text[:200] + ("..." if len(response_text) > 200 else "")
                     status_mark = "[green]✓[/green]" if success else "[red]✗[/red]"
                     self.console.print(f"{status_mark} Ответ отправлен ({len(response_text)} символов)")
 
@@ -290,6 +322,9 @@ class RemoteManager:
             self.console.print(f"[red]Ошибка удалённого режима: {e}[/red]")
         finally:
             self.connected = False
+            if self.ws:
+                await self.ws.close()
+                self.ws = None
 
     def start_listener(self, gemini_client: GeminiClient) -> None:
         """Start background listener task."""
@@ -321,6 +356,19 @@ class GeminiCLI:
         )
         self.remote_manager: Optional[RemoteManager] = None
         self.remote_mode = False
+        self._prompt_session = None
+
+    async def ask(self, message: str, *, password: bool = False, default: str = "") -> str:
+        """Wait for terminal input without blocking remote tasks or interrupt handling."""
+        if self._prompt_session is None:
+            self._prompt_session = PromptSession()
+        with patch_stdout(raw=True):
+            return await self._prompt_session.prompt_async(
+                message, is_password=password, default=default,
+            )
+
+    async def confirm(self, message: str) -> bool:
+        return (await self.ask(f"{message} [y/N]: ")).strip().lower() in {"y", "yes"}
 
     def show_banner(self) -> None:
         banner_text = Text()
@@ -345,7 +393,7 @@ class GeminiCLI:
             ("/clear", "Очистить историю разговора"),
             ("/exit", "Выйти из приложения"),
             ("/model <имя>", "Переключить модель (gemini-2.5-flash, gemini-2.5-pro, ...)"),
-            ("/remote on|off", "Включить/выключить удалённое управление"),
+            ("/remote setup|on|off", "Настроить/включить/выключить удалённое управление"),
             ("/config", "Показать текущие настройки"),
             ("/setup", "Настроить API ключ"),
             ("/file read <path>", "Прочитать файл"),
@@ -360,7 +408,7 @@ class GeminiCLI:
 
     async def setup(self) -> None:
         self.console.print("\n[bold yellow]Настройка Gemini CLI[/bold yellow]\n")
-        api_key = Prompt.ask("Введите Google Gemini API ключ", password=True)
+        api_key = await self.ask("Введите Google Gemini API ключ: ", password=True)
         if api_key:
             self.config.set("api_key", api_key)
             self.client.api_key = api_key
@@ -370,8 +418,9 @@ class GeminiCLI:
 
     def show_config(self) -> None:
         cfg = self.config.data.copy()
-        if cfg.get("api_key"):
-            cfg["api_key"] = cfg["api_key"][:8] + "..." + cfg["api_key"][-4:]
+        for key in ("api_key", "proxy_api_key"):
+            if cfg.get(key):
+                cfg[key] = "********"
 
         text = "\n".join(f"  [cyan]{k}:[/cyan] {v}" for k, v in cfg.items())
         self.console.print(Panel(text, title="Конфигурация", border_style="cyan"))
@@ -425,7 +474,7 @@ class GeminiCLI:
         """Write content to a file with confirmation."""
         path = Path(filepath).expanduser().resolve()
         if path.exists():
-            overwrite = Confirm.ask(f"Файл {path} существует. Перезаписать?")
+            overwrite = await self.confirm(f"Файл {path} существует. Перезаписать?")
             if not overwrite:
                 return
 
@@ -445,11 +494,11 @@ class GeminiCLI:
     async def execute_shell(self, command: str) -> None:
         """Execute shell command with user confirmation."""
         self.console.print(Panel(command, title="Команда", border_style="yellow"))
-        if not Confirm.ask("Выполнить?"):
+        if not await self.confirm("Выполнить?"):
             return
 
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(subprocess.run,
                 command, shell=True, capture_output=True, text=True, timeout=30,
             )
             if result.stdout:
@@ -507,7 +556,7 @@ class GeminiCLI:
         if cmd == "/help":
             self.show_help()
         elif cmd == "/clear":
-            self.client.clear_history()
+            await self.client.clear_history()
             self.console.print("[green]✓ История очищена[/green]")
         elif cmd == "/exit":
             return False
@@ -550,6 +599,19 @@ class GeminiCLI:
     # ── Remote management ────────────────────────────────────────────────────
 
     async def handle_remote(self, arg: str) -> None:
+        self.remote_mode = bool(self.remote_manager and self.remote_manager.connected)
+        if arg.lower() == "setup":
+            server_url = await self.ask(
+                "WebSocket URL прокси: ", default=self.config.get("server_url", DEFAULT_SERVER)
+            )
+            proxy_api_key = await self.ask("PROXY_API_KEY сервера: ", password=True)
+            if not proxy_api_key:
+                self.console.print("[red]Ключ прокси обязателен[/red]")
+                return
+            self.config.set("server_url", server_url)
+            self.config.set("proxy_api_key", proxy_api_key)
+            self.console.print("[green]✓ Настройки сохранены. Подключитесь: /remote on[/green]")
+            return
         if arg.lower() == "on":
             if self.remote_mode:
                 self.console.print("[yellow]Удалённый режим уже включён[/yellow]")
@@ -557,9 +619,11 @@ class GeminiCLI:
 
             server_url = self.config.get("server_url", DEFAULT_SERVER)
             client_name = self.config.get("client_name", platform.node())
-            client_id = f"{client_name}-{datetime.now().strftime('%H%M%S')}"
+            client_id = f"{client_name[:100]}-{uuid.uuid4().hex[:8]}"
 
-            self.remote_manager = RemoteManager(server_url, client_id, self.console)
+            self.remote_manager = RemoteManager(
+                server_url, client_id, self.console, self.config.get("proxy_api_key", "")
+            )
             self.console.print(f"[cyan]Подключение к {server_url}...[/cyan]")
 
             if await self.remote_manager.connect():
@@ -587,7 +651,7 @@ class GeminiCLI:
         else:
             status_text = "включён" if self.remote_mode else "выключен"
             self.console.print(f"[cyan]Удалённый режим: {status_text}[/cyan]")
-            self.console.print("[dim]Использование: /remote on | /remote off[/dim]")
+            self.console.print("[dim]Использование: /remote setup | /remote on | /remote off[/dim]")
 
     # ── Main REPL loop ───────────────────────────────────────────────────────
 
@@ -605,7 +669,7 @@ class GeminiCLI:
 
         while True:
             try:
-                user_input = Prompt.ask("\n[bold cyan]▶[/bold cyan]")
+                user_input = await self.ask("\n▶ ")
 
                 if not user_input.strip():
                     continue
@@ -618,31 +682,11 @@ class GeminiCLI:
 
                 # Send to Gemini with streaming
                 self.console.print()
-                response_text = ""
-
+                chunks = []
                 with self.console.status("[cyan]Думаю...[/cyan]", spinner="dots"):
-                    # Collect first chunk to clear the spinner
-                    first_chunk = True
-                    chunks = []
                     async for chunk in self.client.stream_chat(user_input):
                         chunks.append(chunk)
-                        if first_chunk:
-                            first_chunk = False
-                            break
-
-                # Now render all: first chunk already collected, continue streaming
                 full_response = "".join(chunks)
-                async for chunk in self.client.stream_chat.__wrapped__(self.client, user_input) if False else []:
-                    full_response += chunk
-
-                # Simpler approach: collect full response then render
-                if not full_response:
-                    # Re-do with simple chat for reliability
-                    response_text = ""
-                    with self.console.status("[cyan]Думаю...[/cyan]", spinner="dots"):
-                        async for chunk in self.client.stream_chat(user_input):
-                            response_text += chunk
-                    full_response = response_text
 
                 self.render_response(full_response)
                 self.console.print()
