@@ -82,12 +82,17 @@ if [ ! -f "$CONFIG_FILE" ]; then
     cat > "$CONFIG_FILE" << 'EOF'
 {
   "api_key": "",
-  "model": "gemini-1.5-pro",
+  "model": "gemini-2.5-flash-preview-05-20",
   "server_url": "ws://localhost:8000/ws/remote",
-  "remote_enabled": false,
-  "timeout": 30
+  "proxy_api_key": "",
+  "auto_remote": false,
+  "timeout": 60,
+  "max_tokens": 8192,
+  "temperature": 0.7
 }
 EOF
+    chmod 700 "$CLI_DIR"
+    chmod 600 "$CONFIG_FILE"
     echo "    ✓ Default config created at $CONFIG_FILE"
 fi
 

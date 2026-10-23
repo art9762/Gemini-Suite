@@ -96,6 +96,7 @@ gemini-cli
   "api_key": "AIza...",
   "model": "gemini-2.5-flash-preview-05-20",
   "server_url": "ws://ваш-сервер:8000/ws/remote",
+  "proxy_api_key": "ваш_PROXY_API_KEY",
   "timeout": 60,
   "max_tokens": 8192,
   "temperature": 0.7,
@@ -109,6 +110,7 @@ gemini-cli
 | `api_key` | Ключ Google Gemini API |
 | `model` | Модель по умолчанию |
 | `server_url` | WebSocket URL прокси-сервера |
+| `proxy_api_key` | Ключ доступа к прокси, совпадает с `PROXY_API_KEY` на сервере |
 | `timeout` | Таймаут запросов (секунды) |
 | `max_tokens` | Максимум токенов в ответе |
 | `temperature` | Температура генерации (0.0-1.0) |
@@ -140,6 +142,7 @@ gemini-cli
 | `/config` | Показать настройки |
 | `/model <имя>` | Переключить модель |
 | `/models` | Список доступных моделей |
+| `/remote setup` | Настроить URL и ключ прокси |
 | `/remote on` | Подключиться к прокси для удалённого управления |
 | `/remote off` | Отключить удалённый режим |
 | `/file read <путь>` | Прочитать файл с подсветкой |
@@ -216,6 +219,9 @@ curl http://localhost:8000/health
 На каждой машине, где запущен gemini-cli:
 
 ```
+▶ /remote setup
+  WebSocket URL прокси: ws://your-server:8000/ws/remote
+  PROXY_API_KEY сервера: [скрытый ввод]
 ▶ /remote on
   Подключение к ws://your-server:8000/ws/remote...
   ✓ Удалённый режим включён (id: workstation-153042)
@@ -426,7 +432,7 @@ curl -X POST http://server:8000/v1/messages \
 
 Откройте в браузере:
 ```
-http://your-server:8000/dashboard
+http://your-server:8000/dashboard?key=YOUR_PROXY_API_KEY
 ```
 
 На панели отображается:
@@ -530,7 +536,7 @@ for client in clients:
 curl http://server:8000/health
 
 # Проверить WebSocket
-wscat -c ws://server:8000/ws/remote
+wscat -c ws://server:8000/ws/remote --header "X-API-Key: YOUR_PROXY_API_KEY"
 
 # Убедиться, что в config.json правильный server_url
 cat ~/.gemini-cli/config.json
@@ -595,3 +601,21 @@ server {
     }
 }
 ```
+
+
+## Проверка разработки без ключей и внешних API
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+bash -n gemini-cli/install.sh gemini-proxy/install.sh
+```
+
+Тесты используют временную конфигурацию, синтетические Gemini-ответы и локальный сервер на случайном loopback-порту. Проверяется весь путь REST → WebSocket → CLI во время ожидания ввода, полный ответ чата, отмена запроса и очистка подключений. Запросы к Google не выполняются.
+
+Удалённый клиент теперь отправляет `X-API-Key` при подключении, а сервер подтверждает регистрацию сообщением `registered`. Старые клиенты необходимо обновить и настроить через `/remote setup`. Локальные и удалённые запросы одной CLI-сессии выполняются последовательно и используют общую историю; неудачные и отменённые ответы в историю не добавляются. Ответ чата принимается потоком и отображается целиком после завершения. Удалённые промпты генерируют текст; команды shell и запись файлов выполняются локально через `/exec` и `/file`.
+
+Dashboard требует ключ через `X-API-Key` или параметр `?key=`. Серверный ключ не вставляется в HTML. Не передавайте ссылки с ключом другим людям; URL может сохраняться в истории браузера и журналах reverse proxy. Используйте HTTPS/WSS и измените стандартный `PROXY_API_KEY` перед доступом извне.
+
+Доступность настроенных Gemini-моделей и платные запросы этими проверками не проверяются. Состояние клиентов хранится в памяти одного процесса: для удалённых подключений запускайте один worker; после перезапуска подключитесь заново через `/remote on`.
