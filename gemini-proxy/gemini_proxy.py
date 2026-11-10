@@ -22,9 +22,10 @@ import asyncio
 import json
 import os
 import uuid
+from html import escape
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 import httpx
@@ -134,7 +135,7 @@ class ProxyStats:
         self.total_requests += 1
         self.total_tokens += tokens
         self.request_history.append({
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "model": model,
             "tokens": tokens,
         })
@@ -150,14 +151,13 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         self.client_info: Dict[str, Dict[str, Any]] = {}
         # Pending response futures: request_id → asyncio.Future
-        self._pending: Dict[str, asyncio.Future] = {}
+        self._pending: Dict[str, tuple[str, asyncio.Future]] = {}
 
     async def connect(self, client_id: str, websocket: WebSocket) -> None:
         """Register a new client connection."""
-        await websocket.accept()
         self.active_connections[client_id] = websocket
         self.client_info[client_id] = {
-            "connected_at": datetime.utcnow().isoformat(),
+            "connected_at": datetime.now(timezone.utc).isoformat(),
             "ip": websocket.client[0] if websocket.client else "unknown",
             "status": "idle",
             "last_prompt": None,
@@ -167,6 +167,9 @@ class ConnectionManager:
         """Remove a client connection."""
         self.active_connections.pop(client_id, None)
         self.client_info.pop(client_id, None)
+        for owner, future in self._pending.values():
+            if owner == client_id and not future.done():
+                future.set_result("[error] Клиент отключился")
 
     async def send_prompt(self, client_id: str, prompt: str, timeout: int = 60) -> Optional[str]:
         """
@@ -177,8 +180,8 @@ class ConnectionManager:
             return None
 
         request_id = uuid.uuid4().hex[:12]
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending[request_id] = future
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = (client_id, future)
 
         # Update client status
         if client_id in self.client_info:
@@ -201,17 +204,21 @@ class ConnectionManager:
         finally:
             self._pending.pop(request_id, None)
             if client_id in self.client_info:
-                self.client_info[client_id]["status"] = "idle"
+                busy = any(owner == client_id for owner, _ in self._pending.values())
+                self.client_info[client_id]["status"] = "busy" if busy else "idle"
 
-    def resolve_response(self, request_id: str, response: str) -> None:
+    def resolve_response(self, client_id: str, request_id: str, response: str) -> None:
         """Resolve a pending future when client responds."""
-        future = self._pending.get(request_id)
-        if future and not future.done():
+        pending = self._pending.get(request_id)
+        if not pending:
+            return
+        owner, future = pending
+        if owner == client_id and not future.done():
             future.set_result(response)
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
         """Broadcast a message to all connected clients."""
-        for websocket in self.active_connections.values():
+        for websocket in list(self.active_connections.values()):
             try:
                 await websocket.send_json(message)
             except Exception:
@@ -686,48 +693,68 @@ async def websocket_remote_endpoint(websocket: WebSocket):
     WebSocket endpoint for remote CLI management.
 
     Protocol:
+      Upgrade header: X-API-Key: <PROXY_API_KEY>
       Client → Server: {"type": "register", "client_id": "..."}
+      Server → Client: {"type": "registered", "client_id": "..."}
       Server → Client: {"type": "prompt", "request_id": "...", "prompt": "..."}
       Client → Server: {"type": "response", "request_id": "...", "response": "..."}
     """
     client_id = None
     try:
-        data = await websocket.receive_text()
+        try:
+            verify_api_key(websocket.headers.get("x-api-key"))
+        except HTTPException:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        await websocket.accept()
+        data = await asyncio.wait_for(websocket.receive_text(), timeout=10)
         message = json.loads(data)
 
-        if message.get("type") != "register":
+        if not isinstance(message, dict) or message.get("type") != "register":
             await websocket.close(code=status.WS_1002_PROTOCOL_ERROR)
             return
 
         client_id = message.get("client_id")
-        if not client_id:
+        if not isinstance(client_id, str) or not client_id.strip() or len(client_id) > 128:
+            client_id = None
             await websocket.close(code=status.WS_1002_PROTOCOL_ERROR)
+            return
+        if client_id in connection_manager.active_connections:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
         await connection_manager.connect(client_id, websocket)
         stats.connected_clients.add(client_id)
+        await websocket.send_json({"type": "registered", "client_id": client_id})
 
         # Keep connection alive, handle responses
         while True:
             data = await websocket.receive_text()
             msg = json.loads(data)
+            if not isinstance(msg, dict):
+                await websocket.close(code=status.WS_1002_PROTOCOL_ERROR)
+                break
 
             if msg.get("type") == "response":
                 request_id = msg.get("request_id", "")
                 response = msg.get("response", "")
-                connection_manager.resolve_response(request_id, response)
+                if not isinstance(request_id, str) or not isinstance(response, str):
+                    await websocket.close(code=status.WS_1002_PROTOCOL_ERROR)
+                    break
+                connection_manager.resolve_response(client_id, request_id, response)
 
             elif msg.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
 
     except WebSocketDisconnect:
         pass
-    except json.JSONDecodeError:
-        pass
+    except (json.JSONDecodeError, asyncio.TimeoutError):
+        await websocket.close(code=status.WS_1002_PROTOCOL_ERROR)
     except Exception:
         pass
     finally:
-        if client_id:
+        if client_id and connection_manager.active_connections.get(client_id) is websocket:
             connection_manager.disconnect(client_id)
             stats.connected_clients.discard(client_id)
 
@@ -737,19 +764,20 @@ async def websocket_remote_endpoint(websocket: WebSocket):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_endpoint():
+async def dashboard_endpoint(x_api_key: Optional[str] = Header(None), key: Optional[str] = None):
     """Web dashboard showing proxy statistics, connected clients, and management console."""
+    verify_api_key(x_api_key or key)
     connected_clients = connection_manager.get_connected_clients()
 
     clients_rows = ""
     for c in connected_clients:
         status_badge = "🟢" if c["status"] == "idle" else "🔴"
         clients_rows += f"""<tr>
-            <td><code>{c['client_id']}</code></td>
-            <td>{c['ip']}</td>
-            <td>{status_badge} {c['status']}</td>
-            <td>{c['connected_at']}</td>
-            <td>{c.get('last_prompt') or '—'}</td>
+            <td><code>{escape(c['client_id'])}</code></td>
+            <td>{escape(c['ip'])}</td>
+            <td>{status_badge} {escape(c['status'])}</td>
+            <td>{escape(c['connected_at'])}</td>
+            <td>{escape(c.get('last_prompt') or '—')}</td>
         </tr>"""
 
     if not clients_rows:
@@ -757,7 +785,7 @@ async def dashboard_endpoint():
 
     history_rows = ""
     for req in stats.request_history[-20:]:
-        history_rows += f"<tr><td>{req['timestamp']}</td><td>{req['model']}</td><td>{req['tokens']}</td></tr>"
+        history_rows += f"<tr><td>{escape(req['timestamp'])}</td><td>{escape(req['model'])}</td><td>{req['tokens']}</td></tr>"
 
     html = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -792,7 +820,7 @@ async def dashboard_endpoint():
     <div class="header">
         <h1>Gemini Proxy</h1>
         <span class="badge">v2.0</span>
-        <span class="badge">{MANAGEMENT_MODEL}</span>
+        <span class="badge">{escape(MANAGEMENT_MODEL)}</span>
     </div>
 
     <div class="grid">
@@ -824,7 +852,7 @@ async def dashboard_endpoint():
         {history_rows}
     </table>
 
-    <p class="refresh-note">Авто-обновление каждые 10 сек. Обновлено: {datetime.utcnow().isoformat()}</p>
+    <p class="refresh-note">Авто-обновление каждые 10 сек. Обновлено: {datetime.now(timezone.utc).isoformat()}</p>
 
     <script>
     async function sendMgmt() {{
@@ -835,11 +863,14 @@ async def dashboard_endpoint():
 
         result.textContent = 'Обработка...';
         try {{
+            const apiKey = new URLSearchParams(window.location.search).get('key')
+                || window.prompt('PROXY_API_KEY');
+            if (!apiKey) {{ result.textContent = 'Нужен ключ прокси'; return; }}
             const resp = await fetch('/v1/manage', {{
                 method: 'POST',
                 headers: {{
                     'Content-Type': 'application/json',
-                    'X-API-Key': '{PROXY_API_KEY}'
+                    'X-API-Key': apiKey
                 }},
                 body: JSON.stringify({{command: cmd}})
             }});
@@ -856,7 +887,7 @@ async def dashboard_endpoint():
     </script>
 </body>
 </html>"""
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

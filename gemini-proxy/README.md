@@ -10,7 +10,7 @@ A production-quality FastAPI-based proxy server for Google Gemini API with Anthr
 - **Web Dashboard**: Real-time monitoring of stats, connected clients, and request history
 - **Model Mapping**: Automatic translation of Claude model names to Gemini equivalents
 - **Request Statistics**: Track total requests, tokens used, and connection history
-- **Authentication**: X-API-Key header authentication for all endpoints
+- **Authentication**: X-API-Key authentication for generation, management, WebSockets and dashboard; health, root information and API docs are public
 - **CORS Support**: Enabled for cross-origin requests
 - **Health Checks**: Built-in health check endpoint
 - **Systemd Integration**: Easy installation as systemd service with log rotation
@@ -179,7 +179,7 @@ sudo systemctl restart gemini-proxy
 
 ### Authentication
 
-All endpoints require the `X-API-Key` header:
+Generation and management endpoints require the `X-API-Key` header. WebSocket clients send the same header during the HTTP upgrade. `/health`, `/` and API documentation are public:
 
 ```bash
 curl -H "X-API-Key: your-proxy-api-key" http://localhost:8000/health
@@ -278,10 +278,11 @@ WebSocket endpoint for remote CLI management.
 
 **Protocol:**
 
-1. Client connects to `/ws/remote`
+1. Client connects to `/ws/remote` with `X-API-Key: <PROXY_API_KEY>`
 2. Client sends registration: `{"type": "register", "client_id": "cli-123"}`
-3. Server can send prompts: `{"type": "prompt", "prompt": "Your task"}`
-4. Client sends responses: `{"type": "response", "response": "Result"}`
+3. Server acknowledges `{"type": "registered", "client_id": "cli-123"}`; duplicate IDs and invalid registration are rejected
+4. Server can send prompts: `{"type": "prompt", "request_id": "req-123", "prompt": "Your task"}`
+5. Client sends responses: `{"type": "response", "request_id": "req-123", "response": "Result"}`
 
 **Example (Python):**
 
@@ -291,16 +292,23 @@ import json
 import websockets
 
 async def main():
-    async with websockets.connect('ws://localhost:8000/ws/remote') as ws:
+    async with websockets.connect(
+        'ws://localhost:8000/ws/remote',
+        additional_headers={'X-API-Key': 'your-proxy-api-key'},
+    ) as ws:
         # Register
         await ws.send(json.dumps({"type": "register", "client_id": "cli-123"}))
+
+        # Wait for registration acknowledgement, then receive a prompt
+        registered = json.loads(await ws.recv())
+        assert registered["type"] == "registered"
 
         # Receive prompt
         message = await ws.recv()
         print(f"Received: {message}")
 
         # Send response
-        await ws.send(json.dumps({"type": "response", "response": "Done"}))
+        await ws.send(json.dumps({"type": "response", "request_id": json.loads(message)["request_id"], "response": "Done"}))
 
 asyncio.run(main())
 ```
@@ -461,6 +469,8 @@ You > /config
 # Edit ~/.gemini-cli/config.json to set server_url
 "server_url": "ws://proxy-server:8000/ws/remote"
 
+You > /remote setup
+# Enter server_url and the server PROXY_API_KEY
 You > /remote on
 # Connect to your proxy
 ```
@@ -515,7 +525,7 @@ curl -X POST http://localhost:8000/v1/messages/stream \
 
 ### Increase Worker Count
 
-For production, use multiple uvicorn workers:
+For generation-only deployments, multiple uvicorn workers are possible. Remote connection and pending request state lives in one process; keep `--workers 1` when using CLI management:
 
 Edit `/etc/systemd/system/gemini-proxy.service`:
 
@@ -524,7 +534,7 @@ ExecStart=/opt/gemini-proxy/venv/bin/python3 -m uvicorn \
   gemini_proxy:app \
   --host 0.0.0.0 \
   --port 8000 \
-  --workers 4
+  --workers 1
 ```
 
 ### Use a Reverse Proxy
@@ -572,3 +582,18 @@ For issues or feature requests, visit the project repository.
 - Model mapping
 - Request statistics
 - Systemd service integration
+
+
+## Local regression tests
+
+From the repository root:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
+The tests use synthetic responses and a temporary loopback HTTP/WebSocket server. They cover authenticated registration, a REST prompt reaching a CLI while it waits for terminal input, response ownership, duplicate IDs, disconnect/timeout cleanup, and protected/escaped dashboard output. No Google requests or credentials are required. Client state is not persistent and clients must reconnect after a proxy restart.
+
+The dashboard accepts `X-API-Key` or the documented `?key=` URL parameter. It sends `Cache-Control: no-store` and `Referrer-Policy: no-referrer`, and no longer embeds the server's configured key in HTML. Query keys can still appear in browser history and reverse proxy access logs; do not share such URLs. Use HTTPS/WSS and set a strong `PROXY_API_KEY` before exposing the service.
